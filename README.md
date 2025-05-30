@@ -1,1 +1,108 @@
-# Progetto-di-Ingegneria-Informatica---PoliMi
+# FPGA-Based Interface for High-Speed Custom Chip
+
+This project implements a VHDL-based FPGA system to interface with a custom high-speed data acquisition chip. The FPGA handles SPI communication for chip configuration and manages high-throughput PSI data, which is then packetized and transmitted over Ethernet. This system was developed and tested using a Xilinx Arty A7-35 FPGA board.
+
+---
+
+## 🚀 Project Overview
+
+The core functionality involves:
+* **SPI Master Interface**: For configuring the external custom chip (or the provided `test_DUT` mock-up). Features soft-programmable address/data lengths.
+* **PSI Data Acquisition**: Captures a high-speed parallel data stream (up to 100 MHz).
+* **Ethernet Transmission**: Packetizes the PSI data into Layer 2 Ethernet frames and transmits them using the AXI EthernetLite IP. Achieves ~98 Mbps throughput.
+* **Mock-Up DUT**: A `test_DUT` entity is included to simulate the custom chip's behavior for standalone testing of the FPGA design.
+* **Test Bench**: A sine wave generator within the `TOP_entity` provides test data for the PSI stream, simulating data from the chip's SRAM.
+
+The system architecture is detailed in the [FPGA-Based Interface for a High-Speed Custom Chip: Design and Implementation Report](Relazione_elettronica.pdf).
+
+---
+
+## 🛠️ Hardware and Software Requirements
+
+### FPGA Development
+* **FPGA Board**: Xilinx Arty A7-35 (or a compatible board with sufficient resources and an Ethernet PHY).
+* **Development Software**: Vivado Design Suite 2023.1 or later.
+
+### Python Script for Data Verification
+* **Python**: Version 3.x.
+* **Libraries**:
+    * Scapy: For sniffing and dissecting network packets.
+    * Matplotlib: For plotting the received data.
+    * Struct: (Standard library) For unpacking binary data.
+* **Installation**:
+    ```bash
+    pip install scapy matplotlib
+    ```
+* **Execution**: The script `sniff.py` must be run with administrator/root privileges to allow raw socket access for packet sniffing.
+    ```bash
+    sudo python sniff.py
+    ```
+    Ensure the network interface name (`INTERFACE_NAME`) and the FPGA's MAC address (`TARGET_MAC_ADDRESS`) are correctly configured in the script.
+
+---
+
+## 🧩 VHDL Modules and IP Core Configuration
+
+The project is structured hierarchically with a `TOP_entity` integrating several custom VHDL modules and Xilinx IP cores.
+
+### Custom VHDL Entities:
+* **`TOP_entity.vhd`**: Top-level wrapper, clock generation, test sine wave generator, and module interconnections.
+* **`AXI_interface_PSI.vhd`**: Core logic for PSI data capture, dual input buffering, FIFO interface, AXI state machine, and Ethernet packet assembly (including header generation and endianness correction).
+* **`SPI_interface.vhd`**: SPI master for sending commands, with configurable address and data widths.
+* **`test_DUT.vhd`**: Mock-up of the external chip, responds to SPI commands (address 50 triggers PSI stream) and simulates PSI data flow initiation.
+
+### Xilinx IP Cores:
+
+1.  **AXI EthernetLite MAC (`axi_ethernetlite_0`)**
+    * **Enable Dual Transmit Buffers (Ping-Pong)**: This is a critical setting for achieving high throughput. The `AXI_interface_PSI` module is designed to alternate writes between two distinct base addresses in the IP's address space, effectively utilizing this feature. This allows one packet to be transmitted while the next is being prepared.
+    * **AXI Interface**: AXI4-Lite slave.
+    * **PHY Interface**: Ensure this is configured according to your board's Ethernet PHY (e.g., MII, GMII). For Arty A7, it's typically MII.
+
+2.  **FIFO Generator (`fifo_generator_0`)**
+    * **Type**: Independent Clocks Block RAM (or similar suitable for CDC).
+    * **Data Width (Write/Read)**: 32 bits (to match the internal data path from the PSI input buffers).
+    * **Depth**: A relatively small depth is sufficient due to the efficient data consumption. Simulations show the FIFO remains nearly empty, holding at most a single word during steady-state operation. A depth of 16 or 32 words should be more than adequate, providing some elasticity without consuming excessive BRAM resources. For example, during Ethernet header configuration, a few entries might be temporarily stored.
+    * **Clock Inputs**:
+        * Write Clock: Connected to `psi_clk_pll` (PSI domain).
+        * Read Clock: Connected to `axi_clk` (AXI domain).
+    * **Output Registers**: Typically disabled for lowest latency if timing allows, or enabled for better timing closure.
+
+3.  **Clocking Wizard (`clk_wiz_0`)**
+    * **Input Clock**: System clock from your FPGA board (e.g., 100 MHz on Arty A7).
+    * **Output Clocks**: Configure for four output clocks:
+        1.  `axi_clk`: **100 MHz** (for AXI EthernetLite and AXI interface logic).
+        2.  `spi_clk`: **Configurable** (e.g., 10-25 MHz, depends on the target SPI slave's capability; set according to requirements). For the test, a specific frequency will be generated by the wizard.
+        3.  `psi_clk_pll`: **Up to 100 MHz** (for PSI data input and mock DUT; tested at 95 MHz in the report).
+        4.  `eth_ref_clk`: **Frequency depends on PHY requirements** (e.g., 25 MHz for MII at 100 Mbps). This is crucial for the Ethernet PHY.
+    * **Reset**: Ensure proper reset handling, typically an active-low reset synchronized with the input clock.
+    * **Locked Signal**: Use the `locked` signal to ensure clock stability before enabling downstream logic.
+
+---
+
+## ⚙️ System Operation and Testing
+
+1.  **SPI Configuration**: The `SPI_interface` sends a command (e.g., to address 50) to the `test_DUT`.
+2.  **PSI Stream Trigger**: The `test_DUT`, upon receiving the correct SPI command, initiates a simulated PSI data stream.
+3.  **Data Generation (Test Mode)**: The `TOP_entity` generates a 4-period sine wave, outputting it bit-serially as the PSI data.
+4.  **Data Capture and Buffering**: `AXI_interface_PSI` captures the PSI data using dual 32-bit input buffers and writes full words into the CDC FIFO.
+5.  **Ethernet Packetization**:
+    * The `AXI_interface_PSI` state machine reads data from the FIFO.
+    * It assembles Ethernet frames, writing MAC addresses, type/length field, and payload data to the AXI EthernetLite IP registers. Pay attention to endianness correction for payload data.
+    * The dual transmit buffer (ping-pong) capability of the Ethernet IP is utilized by alternating the write addresses for packet data.
+    * A timeout mechanism ensures that the last (potentially partially filled) packet is sent promptly if the PSI stream ends or pauses. For the test, packet data length is 1400 bytes, and the timeout counter is 127 AXI clock cycles.
+6.  **Data Verification**:
+    * The Python script `sniff.py` captures the transmitted Ethernet packets.
+    * It extracts the payload, parses the 16-bit signed sine wave samples, and plots the result.
+    * A successful plot of 4 sine wave periods, followed by zeros for the remainder of the second packet, confirms correct operation.
+    * "Freerun" mode tests have demonstrated ~98 Mbps throughput.
+    * Logic analyzer tests have confirmed the correct sequencing of SPI and PSI signals.
+
+---
+
+## 🤝 Acknowledgements
+
+This project was developed with the support of Professor Luca Bertulessi and PhD candidate Michele Rocco from Politecnico di Milano.
+
+---
+
+*For detailed architectural descriptions, process operations, and specific test setups, please refer to the full PDF report linked above.*
